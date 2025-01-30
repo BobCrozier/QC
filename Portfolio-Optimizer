@@ -1,0 +1,216 @@
+# quantum_portfolio/
+# └── src/
+#     ├── __init__.py
+#     ├── quantum_optimizer.py
+#     ├── error_mitigation.py
+#     ├── constraints.py
+#     └── utils.py
+# └── tests/
+#     ├── __init__.py
+#     ├── test_optimizer.py
+#     └── test_constraints.py
+
+# src/quantum_optimizer.py
+from typing import List, Tuple, Dict, Optional
+import numpy as np
+from qiskit import QuantumCircuit, QuantumRegister, ClassicalRegister
+from qiskit import Aero, execute
+from qiskit.aqua.algorithms import QAOA
+from qiskit.aqua.components.optimizers import SPSA
+from qiskit.ignis.mitigation.measurement import CompleteMeasFitter
+from qiskit.providers.aer.noise import NoiseModel
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class PortfolioOptimizer:
+    """Quantum Portfolio Optimizer using QAOA with enhanced features."""
+    
+    def __init__(self, 
+                 risk_tolerance: float = 0.5,
+                 max_position_size: float = 0.3,
+                 min_position_size: float = 0.05,
+                 transaction_costs: float = 0.001,
+                 noise_model: Optional[NoiseModel] = None):
+        """
+        Initialize the optimizer with constraints and parameters.
+        
+        Args:
+            risk_tolerance: Trade-off between risk and return (0 to 1)
+            max_position_size: Maximum allocation for any single asset
+            min_position_size: Minimum allocation if asset is selected
+            transaction_costs: Cost per trade as percentage
+            noise_model: Optional quantum hardware noise model
+        """
+        self.risk_tolerance = risk_tolerance
+        self.max_position_size = max_position_size
+        self.min_position_size = min_position_size
+        self.transaction_costs = transaction_costs
+        self.noise_model = noise_model
+        self.error_mitigation = True
+        
+    def _create_cost_hamiltonian(self, 
+                                returns: np.ndarray, 
+                                risk_matrix: np.ndarray,
+                                gamma: float) -> QuantumCircuit:
+        """Creates the cost Hamiltonian part of the QAOA circuit."""
+        n_assets = len(returns)
+        qr = QuantumRegister(n_assets, 'q')
+        cr = ClassicalRegister(n_assets, 'c')
+        circuit = QuantumCircuit(qr, cr)
+        
+        # Risk term
+        for i in range(n_assets):
+            for j in range(i+1, n_assets):
+                circuit.cx(qr[i], qr[j])
+                circuit.rz(2 * gamma * risk_matrix[i][j], qr[j])
+                circuit.cx(qr[i], qr[j])
+        
+        # Return term
+        for i in range(n_assets):
+            circuit.rz(-gamma * returns[i] * (1 - self.risk_tolerance), qr[i])
+            
+        return circuit
+    
+    def _apply_error_mitigation(self, 
+                              circuit: QuantumCircuit,
+                              backend) -> Dict:
+        """Applies measurement error mitigation."""
+        # Create calibration circuits
+        meas_fitter = CompleteMeasFitter(backend)
+        
+        # Apply correction to results
+        mitigated_results = meas_fitter.filter.apply(
+            execute(circuit, backend, shots=8192).result()
+        )
+        return mitigated_results
+    
+    def optimize(self,
+                returns: List[float],
+                risk_matrix: np.ndarray,
+                current_portfolio: Optional[List[float]] = None,
+                p: int = 2) -> Tuple[np.ndarray, Dict]:
+        """
+        Performs portfolio optimization with enhanced features.
+        
+        Args:
+            returns: Expected returns for each asset
+            risk_matrix: Covariance matrix of asset returns
+            current_portfolio: Current holdings for transaction cost calculation
+            p: Number of QAOA steps
+            
+        Returns:
+            Tuple of (optimal weights, optimization metrics)
+        """
+        try:
+            n_assets = len(returns)
+            
+            # Validate inputs
+            if not self._validate_inputs(returns, risk_matrix):
+                raise ValueError("Invalid input parameters")
+            
+            # Initialize optimizer (SPSA generally works better than COBYLA for noisy scenarios)
+            optimizer = SPSA(maxiter=100)
+            
+            # Create circuit with error mitigation
+            circuit = self._create_qaoa_circuit(returns, risk_matrix, p)
+            
+            # Add measurement error mitigation
+            backend = Aero.get_backend('qasm_simulator')
+            if self.noise_model:
+                backend.set_noise_model(self.noise_model)
+            
+            if self.error_mitigation:
+                results = self._apply_error_mitigation(circuit, backend)
+            else:
+                results = execute(circuit, backend, shots=8192).result()
+            
+            # Process results and apply constraints
+            weights = self._process_results(results, n_assets)
+            
+            # Calculate metrics
+            metrics = self._calculate_metrics(weights, returns, risk_matrix, current_portfolio)
+            
+            return weights, metrics
+            
+        except Exception as e:
+            logger.error(f"Optimization failed: {str(e)}")
+            raise
+    
+    def _validate_inputs(self, returns: List[float], risk_matrix: np.ndarray) -> bool:
+        """Validates input parameters."""
+        if len(returns) != risk_matrix.shape[0]:
+            return False
+        if not np.all(np.linalg.eigvals(risk_matrix) > 0):  # Check positive definite
+            return False
+        return True
+    
+    def _calculate_metrics(self,
+                         weights: np.ndarray,
+                         returns: List[float],
+                         risk_matrix: np.ndarray,
+                         current_portfolio: Optional[List[float]]) -> Dict:
+        """Calculates portfolio metrics including transaction costs."""
+        expected_return = np.dot(weights, returns)
+        portfolio_risk = np.sqrt(np.dot(weights.T, np.dot(risk_matrix, weights)))
+        
+        metrics = {
+            'expected_return': expected_return,
+            'portfolio_risk': portfolio_risk,
+            'sharpe_ratio': expected_return / portfolio_risk if portfolio_risk > 0 else 0
+        }
+        
+        if current_portfolio is not None:
+            turnover = np.sum(np.abs(weights - current_portfolio))
+            metrics['transaction_costs'] = turnover * self.transaction_costs
+            metrics['net_expected_return'] = expected_return - metrics['transaction_costs']
+            
+        return metrics
+
+# tests/test_optimizer.py
+import unittest
+import numpy as np
+from src.quantum_optimizer import PortfolioOptimizer
+
+class TestPortfolioOptimizer(unittest.TestCase):
+    def setUp(self):
+        self.optimizer = PortfolioOptimizer(
+            risk_tolerance=0.5,
+            max_position_size=0.3,
+            min_position_size=0.05
+        )
+        
+        # Sample test data
+        self.returns = [0.1, 0.15, 0.08, 0.12]
+        self.risk_matrix = np.array([
+            [0.05, 0.02, 0.01, 0.02],
+            [0.02, 0.06, 0.02, 0.01],
+            [0.01, 0.02, 0.04, 0.02],
+            [0.02, 0.01, 0.02, 0.05]
+        ])
+        
+    def test_optimization(self):
+        weights, metrics = self.optimizer.optimize(
+            self.returns,
+            self.risk_matrix
+        )
+        
+        # Test constraints
+        self.assertLessEqual(max(weights), self.optimizer.max_position_size)
+        self.assertGreaterEqual(min(weights), 0)
+        self.assertAlmostEqual(sum(weights), 1.0, places=2)
+        
+        # Test metrics
+        self.assertIn('expected_return', metrics)
+        self.assertIn('portfolio_risk', metrics)
+        self.assertIn('sharpe_ratio', metrics)
+        
+    def test_error_handling(self):
+        # Test invalid risk matrix
+        invalid_risk_matrix = np.zeros((4, 4))
+        with self.assertRaises(ValueError):
+            self.optimizer.optimize(self.returns, invalid_risk_matrix)
+
+if __name__ == '__main__':
+    unittest.main()
